@@ -1,7 +1,7 @@
 # Anthropic `POST /v1/messages` 透明代理设计文档
 
-- 版本：v0.3 草稿
-- 日期：2026-04-23
+- 版本：v0.4 草稿
+- 日期：2026-04-27
 - 作者：同尘
 - 状态：归档设计稿
 
@@ -21,11 +21,13 @@
 
 ### 2.1 推荐路线
 
-推荐采用三阶段递进方案：
+本文实际实现目标为**方案 B：透明代理 + 原生 caching 观测 + 主动 checkpoint 压缩**。三阶段递进只是落地顺序：
 
 1. **MVP：透明代理 + 审计 + 原生 caching 观测**
 2. **Phase 2：基于前缀内容寻址的 checkpoint 压缩**
 3. **Phase 3：可选本地压缩器 / 同供应商低成本压缩器 / 第三方压缩器**
+
+方案 A 只作为 MVP 的临时子集，不是最终目标；方案 C 不进入当前实现范围。
 
 推荐语言为 **Go**，原因如下：
 
@@ -48,7 +50,7 @@
 
 ### 3.1 范围
 
-本设计在 v0.3 中包含：
+本设计在 v0.4 中包含：
 
 - 代理 Anthropic `POST /v1/messages`
 - 支持非流式与 `stream=true` 的 SSE 流式请求
@@ -148,8 +150,10 @@
 
 ### 推荐
 
-推荐路线是 **B**。  
+推荐且实际要实现的路线是 **B**。
 也就是说，v1 把“客户端已有原生 caching”作为已成立前提，代理专注于做它之上的主动 checkpoint 压缩、观测和回退。
+
+方案 A 仅用于解释最小可上线形态；方案 C 暂不实现，除非后续目标扩展到不具备原生 caching 能力的通用 Anthropic 客户端。
 
 ## 7. 总体架构
 
@@ -255,8 +259,10 @@ R12 = [m1..m10, m11, m12]
 采用**合成 assistant checkpoint**：
 
 - 保留原始 `system`
-- 保留最近 `K` 轮完整对话
+- 保留最近 `N` 轮完整对话，`N` 必须支持配置
 - 用一条合成的 `assistant` 文本消息承载旧历史 checkpoint
+
+这里的“轮”指一组相邻的用户输入及其后续 assistant/tool 结果。checkpoint 只能覆盖较旧的历史，不能压缩结尾 `N` 轮对话，以确保最新任务、刚发生的工具结果、错误上下文和用户最新约束仍以原始消息形式进入模型。
 
 该 checkpoint 不是自由散文，而是固定结构：
 
@@ -295,11 +301,15 @@ R12 = [m1..m10, m11, m12]
 - `estimated_input_tokens >= 32_000`
 - `message_count >= 10`
 
-只有在以下附加条件成立时才真正执行压缩：
+只有在以下附加条件成立时才真正调度后台压缩任务：
 
 - 历史前缀没有可复用 checkpoint
 - 当前请求不是高优先级低延迟模式
 - 当前内容类型在支持集合内
+- 除去配置要求保留的最近 `N` 轮后，仍有足够长的旧历史值得压缩
+- 当前会话前缀没有正在执行的压缩任务
+
+压缩覆盖范围按配置的 `KeepRecentTurns` 计算：若 `KeepRecentTurns=N`，则候选 checkpoint 只能覆盖 `messages[0:coverage_end]`，其中 `coverage_end` 位于最近 `N` 轮之前。低于该边界的最新对话不进入压缩器。
 
 ### 11.2 首批支持范围
 
@@ -339,7 +349,8 @@ cp_3 = compress(cp_2 + m18..m25)
 
 - 请求优先走 passthrough 或 observe-only
 - 当没有现成 checkpoint 且请求是 streaming 时，优先透传，不阻塞主路径
-- 只有在逼近上下文上限且继续透传价值很低时，才允许同步压缩
+- 压缩动作默认异步完成，不阻塞当前对话的正常处理，不把压缩延迟带入主请求
+- 只有在逼近上下文上限且继续透传价值很低时，才允许进入显式的降级/保护策略；同步压缩不作为常态路径
 
 ### 12.2 后台预计算
 
@@ -347,6 +358,13 @@ cp_3 = compress(cp_2 + m18..m25)
 
 - 如果需要，则把压缩任务放入后台 worker
 - 后续请求优先复用已生成 checkpoint
+- 调度后台任务本身必须是轻量操作，不能等待压缩器完成
+- 同一个内容前缀或同一条 append-only 会话链路如果已经有 `building` 状态的 checkpoint 任务，则不重复触发
+- 如果下一轮用户请求到来时上一次压缩仍未完成，本轮请求继续按 passthrough 或已存在 checkpoint 处理，并跳过重复调度
+
+这里的“会话链路”仍然由内容前缀寻址推导，不依赖客户端提供显式 `session_id`。
+
+理想情况下，用户下一轮对话到来前，上一次响应后触发的 checkpoint 已经生成完毕；若未完成，也不能影响下一轮请求延迟。
 
 这使得大多数“第一次真正使用 checkpoint 的请求”之前，checkpoint 已经在后台准备好。
 
@@ -362,9 +380,14 @@ type ProxyConfig struct {
     AssumeClientPromptCache bool
     EnableCheckpointing     bool
     CheckpointCompressor    string
+    CompressorBaseURL       string
+    CompressorModel         string
+    CompressorAPIKey        string
     TokenSoftLimit          int
     MessageCountThreshold   int
     KeepRecentTurns         int
+    CheckpointAsyncWorkers  int
+    UsageSQLitePath         string
 }
 
 type PrefixNode struct {
@@ -381,10 +404,13 @@ type CheckpointRecord struct {
     PrefixHash          string
     ParentPrefixHash    string
     CoverageEndIndex    int
+    KeepRecentTurns     int
     SummaryFormat       string
     SummaryText         string
     CompressorMode      string
+    BuildStatus         string
     CreatedAt           time.Time
+    UpdatedAt           time.Time
 }
 
 type AuditRecord struct {
@@ -394,11 +420,20 @@ type AuditRecord struct {
     Stream                   bool
     UpstreamStatus           int
     DurationMs               int64
+    CustomerOriginalInputTokens int
+    OriginalEstimatedInputTokens int
+    ForwardEstimatedInputTokens  int
+    SavedInputTokens             int
+    EstimatedSavedInputTokens    int
+    SavedInputTokenPercent       float64
     InputTokens              int
     OutputTokens             int
     CacheCreationInputTokens int
     CacheReadInputTokens     int
     CheckpointHit            bool
+    CheckpointCoverageEndIndex int
+    CheckpointCompressor         string
+    CheckpointCompressorModel    string
     PassthroughReason        string
     ErrorClass               string
     CreatedAt                time.Time
@@ -407,12 +442,80 @@ type AuditRecord struct {
 
 ### 13.2 存储选型
 
-推荐使用 **SQLite** 作为第一版本地状态库：
+第一版将 token 用量和节省统计持久化到 **SQLite**，checkpoint 缓存仍保留在内存中：
 
 - 部署简单
 - 查询与索引足够
 - 易于导出审计数据
-- 比纯文件和内存 map 更适合 prefix DAG 与统计查询
+- 比纯 JSONL 更适合按模型、时间、checkpoint 命中做累计查询
+- 不把 checkpoint 内容持久化，避免压缩缓存扩大本地敏感数据面
+
+SQLite 默认路径：
+
+```text
+data/usage.sqlite
+```
+
+可通过 `OPTIPROXY_USAGE_SQLITE_PATH` 配置。
+
+核心表：
+
+```sql
+CREATE TABLE usage_records (
+    request_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    prefix_hash TEXT,
+    model TEXT,
+    stream INTEGER NOT NULL DEFAULT 0,
+    upstream_status INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    customer_original_input_tokens INTEGER NOT NULL DEFAULT 0,
+    original_estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+    forward_estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+    saved_input_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_saved_input_tokens INTEGER NOT NULL DEFAULT 0,
+    saved_input_token_percent REAL NOT NULL DEFAULT 0,
+    upstream_input_tokens INTEGER NOT NULL DEFAULT 0,
+    upstream_output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    checkpoint_hit INTEGER NOT NULL DEFAULT 0,
+    checkpoint_coverage_end_index INTEGER NOT NULL DEFAULT 0,
+    checkpoint_compressor TEXT,
+    checkpoint_compressor_model TEXT,
+    passthrough_reason TEXT,
+    error_class TEXT
+);
+```
+
+节省统计口径：
+
+```text
+estimated_saved_input_tokens =
+  max(0, original_estimated_input_tokens - forward_estimated_input_tokens)
+```
+
+对外查询优先使用语义更直观的别名字段：
+
+- `customer_original_input_tokens`：客户原始请求在压缩前的 input token 估算
+- `saved_input_tokens`：checkpoint 压缩节省的 input token 估算
+- `saved_input_token_percent`：`saved_input_tokens / customer_original_input_tokens * 100`
+- `checkpoint_compressor`：压缩器模式，例如 `openai-chat`
+- `checkpoint_compressor_model`：压缩使用的模型，例如 `glm-5.1`
+
+`saved_input_tokens` 只在 `checkpoint_hit=true` 时记入压缩节省；Anthropic 原生 prompt cache 的收益单独看 `cache_read_input_tokens`。
+
+### 13.3 Checkpoint 构建状态与去重
+
+checkpoint 构建需要持久化状态，避免并发请求或连续多轮对话重复触发同一段历史的压缩：
+
+- `BuildStatus` 至少包含 `building`、`ready`、`failed`
+- 构建唯一键由 `PrefixHash + CoverageEndIndex + KeepRecentTurns + CompressorMode` 组成
+- 调度前先用事务查询/占位；如果同一构建键已经是 `building`，直接跳过调度
+- worker 完成后把状态更新为 `ready` 并写入 `SummaryText`
+- worker 失败时写入 `failed` 与错误分类，后续是否重试由退避策略决定
+
+该状态只用于后台任务协调，不作为主请求必须等待的依赖。
 
 ## 14. 压缩器策略
 
@@ -425,16 +528,30 @@ type AuditRecord struct {
 3. `local-model`
 4. `third-party-cloud`
 
+当前代码实现先支持：
+
+- `local-extractive`：本地抽取式开发实现，不依赖外部模型
+- `openai-chat`：对接 OpenAI Chat Completions 兼容 API
+
+`openai-chat` 需要配置：
+
+- `OPTIPROXY_COMPRESSOR_BASE_URL`
+- `OPTIPROXY_COMPRESSOR_MODEL`
+- `OPTIPROXY_COMPRESSOR_API_KEY`
+
+`BASE_URL` 可以是服务根地址、`/v1` API 根地址，或完整 `/chat/completions` 地址。
+
 ### 14.2 推荐默认值
 
 默认推荐：
 
 - `EnableCheckpointing=false`
-- 或启用后使用 `anthropic-low-cost`
+- 若启用远端压缩器，必须显式配置压缩器模式、BASE URL、模型名和 API KEY
+- 当前实现中，OpenAI Chat Completions 兼容接口使用 `openai-chat`
 
 原因：
 
-- 避免把敏感代码/对话发送给第二家供应商
+- 避免在未明确配置时把敏感代码/对话发送给第二家供应商
 - 更容易满足企业合规诉求
 - 先把压缩语义跑通，再扩展压缩器来源
 
@@ -462,9 +579,10 @@ flowchart TD
     I --> J[转发上游]
     G --> K[接收 JSON 或 SSE 响应]
     J --> K
-    K --> L[采集 usage/状态/耗时]
-    L --> M[异步调度下一前缀的 checkpoint 预计算]
-    M --> N[返回客户端]
+    K --> N[透传或返回客户端]
+    K -.旁路.-> L[采集 usage/状态/耗时]
+    L -.轻量调度.-> M[登记下一前缀的 checkpoint 构建任务]
+    M -.后台 worker.-> O[异步生成 checkpoint]
 ```
 
 ## 16. 流式处理设计
@@ -577,7 +695,8 @@ flowchart TD
 - `internal/canonicalize`：请求规范化与 hash
 - `internal/optimize`：Baseline 观测与 L1 压缩规划
 - `internal/checkpoint`：checkpoint 构造、压缩器接口
-- `internal/store`：SQLite 持久化
+- `internal/store`：内存 prefix/checkpoint 状态
+- `internal/audit`：JSONL 审计与 SQLite usage 持久化
 - `internal/audit`：审计事件
 - `internal/metrics`：指标导出
 
@@ -616,7 +735,7 @@ flowchart TD
 2. 在已有原生 caching 的前提下，checkpoint 还能带来多少额外节省。
 3. assistant checkpoint 相比 user-summary 注入是否显著更稳。
 4. 工具调用和 thinking 历史在多大程度上适合进入 checkpoint。
-5. 后台预计算是否足以覆盖大部分长会话，不让首次同步压缩落在热路径。
+5. 后台预计算是否足以覆盖大部分长会话，不让 checkpoint 构建落在热路径。
 
 ## 23. 最终建议
 

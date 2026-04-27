@@ -1,0 +1,5 @@
+data/
+/bin/
+/.cache/
+/LLM-OptiProxy
+/proxy
