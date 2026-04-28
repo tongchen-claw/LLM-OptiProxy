@@ -25,6 +25,12 @@ func main() {
 	}
 	defer auditLogger.Close()
 
+	savingsLogger, err := audit.NewSavingsLogger(cfg.SavingsLogPath)
+	if err != nil {
+		log.Fatalf("create savings logger: %v", err)
+	}
+	defer savingsLogger.Close()
+
 	state := store.NewMemoryStore()
 	checkpoints := checkpoint.NewManager(cfg, state)
 
@@ -36,6 +42,7 @@ func main() {
 	handler := httpserver.New(httpserver.Dependencies{
 		Config:      cfg,
 		Audit:       auditLogger,
+		SavingsLog:  savingsLogger,
 		Store:       state,
 		Checkpoints: checkpoints,
 	})
@@ -55,7 +62,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("config: listen_addr=%s upstream_base_url=%s enable_audit=%t audit_log_path=%s usage_sqlite_path=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, cfg.EnableAudit, cfg.AuditLogPath, cfg.UsageSQLitePath)
+	log.Printf("config: listen_addr=%s upstream_base_url=%s enable_audit=%t audit_log_path=%s usage_sqlite_path=%s savings_log_path=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, cfg.EnableAudit, cfg.AuditLogPath, cfg.UsageSQLitePath, cfg.SavingsLogPath)
 	log.Printf(
 		"config: enable_checkpointing=%t checkpoint_compressor=%s compressor_base_url=%s compressor_model=%s compressor_api_key_configured=%t keep_recent_turns=%d token_soft_limit=%d message_count_threshold=%d checkpoint_async_workers=%d",
 		cfg.EnableCheckpointing,

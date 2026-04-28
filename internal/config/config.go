@@ -23,6 +23,7 @@ type Config struct {
 	CheckpointAsyncWorkers  int
 	AuditLogPath            string
 	UsageSQLitePath         string
+	SavingsLogPath          string
 	MaxBodyBytes            int64
 	MaxSummaryChars         int
 	UpstreamTimeout         time.Duration
@@ -45,6 +46,7 @@ func Load() Config {
 		CheckpointAsyncWorkers:  envInt("OPTIPROXY_CHECKPOINT_ASYNC_WORKERS", 1),
 		AuditLogPath:            envString("OPTIPROXY_AUDIT_LOG_PATH", "data/audit.jsonl"),
 		UsageSQLitePath:         envString("OPTIPROXY_USAGE_SQLITE_PATH", "data/usage.sqlite"),
+		SavingsLogPath:          envString("OPTIPROXY_SAVINGS_LOG_PATH", "-"),
 		MaxBodyBytes:            int64(envInt("OPTIPROXY_MAX_BODY_BYTES", 32*1024*1024)),
 		MaxSummaryChars:         envInt("OPTIPROXY_MAX_SUMMARY_CHARS", 6000),
 		UpstreamTimeout:         time.Duration(envInt("OPTIPROXY_UPSTREAM_TIMEOUT_SECONDS", 0)) * time.Second,

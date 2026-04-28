@@ -25,6 +25,7 @@ import (
 type Dependencies struct {
 	Config      config.Config
 	Audit       *audit.Logger
+	SavingsLog  *audit.SavingsLogger
 	Store       store.Store
 	Checkpoints *checkpoint.Manager
 }
@@ -32,6 +33,7 @@ type Dependencies struct {
 type Server struct {
 	cfg         config.Config
 	audit       *audit.Logger
+	savingsLog  *audit.SavingsLogger
 	store       store.Store
 	checkpoints *checkpoint.Manager
 	client      *http.Client
@@ -47,6 +49,7 @@ func New(deps Dependencies) http.Handler {
 	s := &Server{
 		cfg:         deps.Config,
 		audit:       deps.Audit,
+		savingsLog:  deps.SavingsLog,
 		store:       deps.Store,
 		checkpoints: deps.Checkpoints,
 		client:      client,
@@ -77,7 +80,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		record.ErrorClass = "method_not_allowed"
 		record.DurationMs = time.Since(start).Milliseconds()
-		s.audit.Log(record)
+		s.logRecord(record)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -86,7 +89,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		record.ErrorClass = "request_body_read_failed"
 		record.DurationMs = time.Since(start).Milliseconds()
-		s.audit.Log(record)
+		s.logRecord(record)
 		return
 	}
 	record.OriginalEstimatedInputTokens = canonicalize.EstimateBodyTokens(body)
@@ -138,7 +141,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		record.ErrorClass = "upstream_request_failed"
 		record.PassthroughReason = passthroughReason
 		record.DurationMs = time.Since(start).Milliseconds()
-		s.audit.Log(record)
+		s.logRecord(record)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
@@ -163,10 +166,19 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		record.ErrorClass = "response_relay_failed"
 	}
-	s.audit.Log(record)
+	s.logRecord(record)
 
 	if err == nil && parsed != nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
 		s.checkpoints.Schedule(parsed, analysis)
+	}
+}
+
+func (s *Server) logRecord(record audit.Record) {
+	if s.audit != nil {
+		s.audit.Log(record)
+	}
+	if s.savingsLog != nil {
+		s.savingsLog.Log(record)
 	}
 }
 

@@ -31,6 +31,14 @@ OPTIPROXY_MESSAGE_COUNT_THRESHOLD=10 \
 go run ./cmd/proxy
 ```
 
+When a local checkpoint is hit and replaces older messages in the forwarded request, the proxy writes a JSONL savings log entry if estimated input tokens were saved. By default this goes to stdout. Configure the destination with:
+
+```sh
+OPTIPROXY_SAVINGS_LOG_PATH=data/savings.jsonl ./bin/llm-optiproxy
+```
+
+Use `-` to write savings entries to stdout.
+
 When running the compiled binary, the last environment variable line must not end with a trailing `\` unless the binary command is on the next physical line:
 
 ```sh
@@ -38,6 +46,7 @@ OPTIPROXY_LISTEN_ADDR=:8080 \
 OPTIPROXY_UPSTREAM_BASE_URL=https://api.openai-proxy.org/anthropic \
 OPTIPROXY_ENABLE_CHECKPOINTING=true \
 OPTIPROXY_CHECKPOINT_COMPRESSOR=openai-chat \
+OPTIPROXY_SAVINGS_LOG_PATH=data/savings.jsonl \
 OPTIPROXY_COMPRESSOR_BASE_URL=https://api.openai-proxy.org \
 OPTIPROXY_COMPRESSOR_MODEL=your-compressor-model \
 OPTIPROXY_COMPRESSOR_API_KEY="$COMPRESSOR_API_KEY" \
